@@ -1,0 +1,29 @@
+# Built binaries
+/bin/
+/run
+/seed-samples
+/compare-runs
+*.exe
+
+# Output and run artifacts
+/output/
+/work/
+
+# Generated sample files (samples/<pkg>/<ds>/samples.log or samples.ndjson)
+/samples/
+*.ndjson
+
+# Go
+*.test
+*.out
+/coverage.txt
+/vendor/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Config
+config.yaml

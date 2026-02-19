@@ -1,0 +1,23 @@
+integrations_dir: ~/git/integrations
+kibana_url: http://localhost:5601
+connector_id: "<inference-connector-id>"
+auth:
+  type: api_key  # or basic
+  api_key: "..." # or username/password
+packages: [nginx, redis]  # or path to list file
+output_dir: ./output
+ecs_fields_url: "https://github.com/elastic/ecs/raw/v9.3.0/generated/csv/fields.csv"
+# Consistency mode (default: cross_package_only)
+consistency_runs: 10
+# consistency_compare_mode: cross_package_only   # default; or per_package
+# pass_threshold: 80
+# score_weights: { programmatic: 0.3, pipeline_equivalence: 0.25, processor_choice: 0.2, ecs_vendor: 0.25 }
+# skip_packages_without_samples: true
+# cleanup_after_run: true
+# http_retries: 3
+# http_timeout: 60s
+# gemini_timeout: 120s
+# gemini_temperature: 0
+# seed: 42
+# integrations_ref: "main"
+# gemini_model: "gemini-3-flash-preview"
