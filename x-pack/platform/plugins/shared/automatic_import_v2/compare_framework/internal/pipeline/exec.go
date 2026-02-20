@@ -5,35 +5,35 @@
 package pipeline
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"compare_framework/internal/client"
 	"compare_framework/internal/samples"
+
+	"gopkg.in/yaml.v3"
 )
 
-// ExecOptions configures pipeline execution via elastic-package.
+const maxSimulateDocs = 1000
+
+// ExecOptions configures pipeline execution via Kibana simulate API.
 type ExecOptions struct {
 	IntegrationsDir string
-	RunDir          string        // run output dir containing packages/<pkg>/<ds>/result.json and golden.json
-	SamplesDir      string        // base dir for samples/<pkg>/<ds>/samples.log or samples.ndjson
-	WorkDir         string        // directory for work/golden_<pkg>_<ds> and work/generated_<pkg>_<ds>
-	Timeout         time.Duration
+	RunDir          string // run output dir containing packages/<pkg>/<ds>/result.json
+	SamplesDir      string // base dir for samples/<pkg>/<ds>/samples.log or samples.ndjson
+	Client          *client.Client
 }
 
-// RunOutput holds the path to the test output for one run (golden or generated).
+// RunOutput holds the simulate result for one run (golden or generated).
 type RunOutput struct {
-	Dir    string
 	Output string
 	Err    error
 }
 
-// ExecResult is the result of running pipeline tests for one package/data stream.
+// ExecResult is the result of running pipeline simulate for one package/data stream.
 type ExecResult struct {
 	Package    string
 	DataStream string
@@ -41,15 +41,12 @@ type ExecResult struct {
 	Generated  RunOutput
 }
 
-// Exec runs elastic-package test pipeline for each package/data stream in runDir. It copies the golden package
-// twice, replaces pipeline test inputs with framework samples, and in the generated copy replaces the ingest
-// pipeline with the one from result.json. Returns one ExecResult per package/data stream.
+// Exec runs Kibana ingest pipeline simulate for each package/data stream in runDir.
+// For each pkg/ds: loads golden pipeline from integrations dir, generated pipeline from result.json,
+// samples from SamplesDir; calls simulate API for both pipelines and records output/errors.
 func Exec(opts ExecOptions) ([]ExecResult, error) {
-	if opts.WorkDir == "" {
-		opts.WorkDir = filepath.Join(opts.RunDir, "work")
-	}
-	if err := os.MkdirAll(opts.WorkDir, 0755); err != nil {
-		return nil, err
+	if opts.Client == nil {
+		return nil, fmt.Errorf("pipeline.Exec: Client is required")
 	}
 	packagesDir := filepath.Join(opts.RunDir, "packages")
 	entries, err := os.ReadDir(packagesDir)
@@ -97,117 +94,107 @@ func execOne(opts ExecOptions, pkg, dataStream string) ExecResult {
 		res.Generated.Err = err
 		return res
 	}
-	goldenPkgPath := filepath.Join(opts.IntegrationsDir, "packages", pkg)
 	samplesPath, err := samples.ResolveSamplesPath(opts.SamplesDir, pkg, dataStream)
 	if err != nil {
+		res.Golden.Err = err
 		res.Generated.Err = err
 		return res
 	}
-	samplesData, _ := os.ReadFile(samplesPath)
-	workGolden := filepath.Join(opts.WorkDir, "golden_"+pkg+"_"+dataStream)
-	workGenerated := filepath.Join(opts.WorkDir, "generated_"+pkg+"_"+dataStream)
-	if err := copyDir(goldenPkgPath, workGolden); err != nil {
+	samplesData, err := os.ReadFile(samplesPath)
+	if err != nil {
+		res.Golden.Err = err
+		res.Generated.Err = err
+		return res
+	}
+	docs := samplesToSimulateDocs(samplesData)
+	if len(docs) == 0 {
+		res.Golden.Err = fmt.Errorf("no sample documents")
+		res.Generated.Err = fmt.Errorf("no sample documents")
+		return res
+	}
+	goldenPipeline, err := loadGoldenPipeline(opts.IntegrationsDir, pkg, dataStream)
+	if err != nil {
 		res.Golden.Err = err
 		return res
 	}
-	if err := copyDir(goldenPkgPath, workGenerated); err != nil {
-		res.Generated.Err = err
-		return res
-	}
-	pipeInputDir := filepath.Join(workGolden, "data_stream", dataStream, "_dev", "test", "pipeline")
-	if err := writeSamplesAsPipelineInput(pipeInputDir, samplesData); err != nil {
-		res.Golden.Err = err
-		return res
-	}
-	pipeInputDirGen := filepath.Join(workGenerated, "data_stream", dataStream, "_dev", "test", "pipeline")
-	if err := writeSamplesAsPipelineInput(pipeInputDirGen, samplesData); err != nil {
-		res.Generated.Err = err
-		return res
-	}
-	// Replace ingest pipeline in generated copy with AIv2 output
-	pipeDir := filepath.Join(workGenerated, "data_stream", dataStream, "elasticsearch", "ingest_pipeline")
+	res.Golden.Output, res.Golden.Err = runSimulate(opts.Client, goldenPipeline, docs)
 	if result.IngestPipeline != nil {
-		if err := writeGeneratedPipeline(pipeDir, result.IngestPipeline); err != nil {
-			res.Generated.Err = err
-			return res
-		}
+		res.Generated.Output, res.Generated.Err = runSimulate(opts.Client, result.IngestPipeline, docs)
+	} else {
+		res.Generated.Err = fmt.Errorf("result.json has no ingestPipeline")
 	}
-	// Run elastic-package test pipeline for both
-	res.Golden.Dir = workGolden
-	res.Golden.Output, res.Golden.Err = runElasticPackageTest(context.Background(), workGolden, dataStream, opts.Timeout)
-	res.Generated.Dir = workGenerated
-	res.Generated.Output, res.Generated.Err = runElasticPackageTest(context.Background(), workGenerated, dataStream, opts.Timeout)
 	return res
 }
 
-func writeSamplesAsPipelineInput(pipeDir string, samples []byte) error {
-	if err := os.MkdirAll(pipeDir, 0755); err != nil {
-		return err
-	}
-	// Write as test-input.log (one sample per line) for pipeline test consumption
-	outPath := filepath.Join(pipeDir, "test-input.log")
-	return os.WriteFile(outPath, samples, 0644)
-}
-
-func writeGeneratedPipeline(pipeDir string, pipeline interface{}) error {
+func loadGoldenPipeline(integrationsDir, pkg, dataStream string) (interface{}, error) {
+	pipeDir := filepath.Join(integrationsDir, "packages", pkg, "data_stream", dataStream, "elasticsearch", "ingest_pipeline")
 	entries, err := os.ReadDir(pipeDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, e := range entries {
-		if !e.IsDir() && (strings.HasSuffix(e.Name(), ".yml") || strings.HasSuffix(e.Name(), ".yaml") || strings.HasSuffix(e.Name(), ".json")) {
-			if err := os.Remove(filepath.Join(pipeDir, e.Name())); err != nil {
-				return err
-			}
-		}
-	}
-	b, err := json.MarshalIndent(pipeline, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(pipeDir, "default.json"), b, 0644)
-}
-
-func runElasticPackageTest(ctx context.Context, workDir, dataStream string, timeout time.Duration) (string, error) {
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	cmd := exec.CommandContext(ctx, "elastic-package", "test", "pipeline", "-C", workDir, "-d", dataStream)
-	cmd.Dir = workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("elastic-package: %w", err)
-	}
-	return string(out), nil
-}
-
-func copyDir(src, dst string) error {
-	if err := os.MkdirAll(dst, 0755); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		sp := filepath.Join(src, e.Name())
-		dp := filepath.Join(dst, e.Name())
 		if e.IsDir() {
-			if err := copyDir(sp, dp); err != nil {
-				return err
-			}
 			continue
 		}
-		data, err := os.ReadFile(sp)
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		path := filepath.Join(pipeDir, name)
+		data, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := os.WriteFile(dp, data, 0644); err != nil {
-			return err
+		var out map[string]interface{}
+		if strings.HasSuffix(name, ".json") {
+			if err := json.Unmarshal(data, &out); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := yaml.Unmarshal(data, &out); err != nil {
+				return nil, err
+			}
 		}
+		return out, nil
 	}
-	return nil
+	return nil, fmt.Errorf("no pipeline file in %s", pipeDir)
 }
 
+func samplesToSimulateDocs(data []byte) []client.SimulateDocument {
+	lines := strings.Split(string(data), "\n")
+	var docs []client.SimulateDocument
+	for i, line := range lines {
+		if i >= maxSimulateDocs {
+			break
+		}
+		line = strings.TrimSuffix(line, "\r")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		docs = append(docs, client.SimulateDocument{
+			Index:  "index",
+			ID:     fmt.Sprintf("%d", i+1),
+			Source: map[string]interface{}{"message": line},
+		})
+	}
+	return docs
+}
+
+func runSimulate(c *client.Client, pipeline interface{}, docs []client.SimulateDocument) (string, error) {
+	resp, err := c.SimulatePipeline(pipeline, docs, false)
+	if err != nil {
+		return "", err
+	}
+	var errMsgs []string
+	for i, d := range resp.Docs {
+		if d.Doc != nil && d.Doc.Error != nil {
+			errMsgs = append(errMsgs, fmt.Sprintf("doc[%d]: %s", i, d.Doc.Error.Message))
+		}
+	}
+	if len(errMsgs) > 0 {
+		return "", fmt.Errorf("simulate errors: %s", strings.Join(errMsgs, "; "))
+	}
+	out, _ := json.Marshal(resp)
+	return string(out), nil
+}

@@ -55,7 +55,7 @@ func Run(cfg *config.Config, runDir string, samplesDir string) (*ConsistencyRepo
 	var summaries []runner.RunSummary
 	for i := 0; i < cfg.ConsistencyRuns; i++ {
 		subDir := filepath.Join(runDir, fmt.Sprintf("run_%d", i+1))
-		sum, code, err := r.Run(subDir, samplesDir, fmt.Sprintf("run_%d", i+1))
+		sum, code, err := r.Run(subDir, samplesDir, fmt.Sprintf("run_%d", i+1), false)
 		if err != nil {
 			return report, 1, err
 		}

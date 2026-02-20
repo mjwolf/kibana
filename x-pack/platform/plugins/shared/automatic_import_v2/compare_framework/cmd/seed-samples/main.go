@@ -35,10 +35,11 @@ func main() {
 
 	names, _ := cfg.PackageList()
 	opts := samples.SeedOptions{
-		IntegrationsDir: cfg.IntegrationsDir,
-		OutputDir:       base,
-		Seed:            cfg.Seed,
-		PackageFilter:   names,
+		IntegrationsDir:  cfg.IntegrationsDir,
+		OutputDir:        base,
+		Seed:             cfg.Seed,
+		PackageFilter:    names,
+		DataStreamFilter: cfg.DataStreams,
 	}
 	written, err := samples.Seed(opts)
 	if err != nil {

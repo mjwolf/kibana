@@ -5,7 +5,11 @@ auth:
   type: api_key  # or basic
   api_key: "..." # or username/password
 packages: [nginx, redis]  # or path to list file
+# data_streams:          # optional: filter which data streams per package (omit package to test all)
+#   nginx: [access]
+#   redis: [log, slowlog]
 output_dir: ./output
+# pregenerated_packages_dir: ./output/run_20260220_120917/packages  # when set, load package zips from here instead of calling Kibana API
 ecs_fields_url: "https://github.com/elastic/ecs/raw/v9.3.0/generated/csv/fields.csv"
 # Consistency mode (default: cross_package_only)
 consistency_runs: 10
@@ -21,3 +25,6 @@ consistency_runs: 10
 # seed: 42
 # integrations_ref: "main"
 # gemini_model: "gemini-3-flash-preview"
+# langsmith:                    # optional: enable LangSmith tracing
+#   project_name: "my-project"
+#   api_key: "lsv2_pt_..."

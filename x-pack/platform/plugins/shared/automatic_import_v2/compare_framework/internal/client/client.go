@@ -38,6 +38,8 @@ type Client struct {
 	authHeader string
 	http       *http.Client
 	retries    int
+	// Logf, when set, is called for each API response (e.g. verbose logging). Format string should not include a newline.
+	Logf func(format string, args ...interface{})
 }
 
 // New builds a client. baseURL is Kibana root (e.g. http://localhost:5601). authHeader is "ApiKey <key>" or "Basic <base64>".
@@ -88,6 +90,13 @@ func (c *Client) do(method, path string, body interface{}, out interface{}) erro
 		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if c.Logf != nil {
+			msg := string(bodyBytes)
+			if len(msg) > 300 {
+				msg = msg[:300] + "..."
+			}
+			c.Logf("%s %s -> HTTP %d %s", method, path, resp.StatusCode, msg)
+		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if out != nil && len(bodyBytes) > 0 {
 				if err := json.Unmarshal(bodyBytes, out); err != nil {
@@ -153,14 +162,21 @@ func (c *Client) GetIntegration(integrationID string) (*IntegrationResponse, err
 	return &out.IntegrationResponse, nil
 }
 
+// LangSmithOptions configures LangSmith tracing for a request.
+type LangSmithOptions struct {
+	ProjectName string `json:"projectName" yaml:"project_name"`
+	APIKey      string `json:"apiKey" yaml:"api_key"`
+}
+
 // CreateIntegrationRequest is the PUT body for create/update integration.
 type CreateIntegrationRequest struct {
-	IntegrationID string                `json:"integrationId"`
-	Title         string                `json:"title"`
-	Description   string                `json:"description"`
-	Logo          string                `json:"logo,omitempty"`
-	ConnectorID   string                `json:"connectorId"`
-	DataStreams   []CreateDataStreamReq `json:"dataStreams,omitempty"`
+	IntegrationID    string                `json:"integrationId"`
+	Title            string                `json:"title"`
+	Description      string                `json:"description"`
+	Logo             string                `json:"logo,omitempty"`
+	ConnectorID      string                `json:"connectorId"`
+	DataStreams       []CreateDataStreamReq `json:"dataStreams,omitempty"`
+	LangSmithOptions *LangSmithOptions     `json:"langSmithOptions,omitempty"`
 }
 
 // CreateDataStreamReq is one data stream in the create request.
@@ -216,10 +232,10 @@ func (c *Client) UploadSamples(integrationID, dataStreamID string, samples []str
 	return c.do(http.MethodPost, path, body, nil)
 }
 
-// DataStreamResults is the get-results response.
+// DataStreamResults is the get-results response (API uses snake_case).
 type DataStreamResults struct {
-	IngestPipeline interface{}   `json:"ingestPipeline,omitempty"`
-	PipelineDocs   interface{}   `json:"pipeline_docs,omitempty"`
+	IngestPipeline interface{}   `json:"ingest_pipeline,omitempty"`
+	PipelineDocs   interface{}   `json:"results,omitempty"`
 	Status         string        `json:"status,omitempty"`
 	Duration       time.Duration `json:"duration,omitempty"`
 }
@@ -234,8 +250,64 @@ func (c *Client) GetDataStreamResults(integrationID, dataStreamID string) (*Data
 	return &out, nil
 }
 
+// GetDataStreamStatus returns the status of a data stream by querying the integration detail endpoint.
+// Returns one of "pending", "completed", "failed", or "" on error.
+func (c *Client) GetDataStreamStatus(integrationID, dataStreamID string) (string, error) {
+	resp, err := c.GetIntegration(integrationID)
+	if err != nil {
+		return "", err
+	}
+	for _, ds := range resp.DataStreams {
+		if ds.DataStreamID == dataStreamID {
+			return ds.Status, nil
+		}
+	}
+	return "", fmt.Errorf("data stream %s not found in integration %s", dataStreamID, integrationID)
+}
+
 // DeleteDataStream deletes a data stream.
 func (c *Client) DeleteDataStream(integrationID, dataStreamID string) error {
 	path := apiPrefix + "/integrations/" + url.PathEscape(integrationID) + "/data_streams/" + url.PathEscape(dataStreamID)
 	return c.do(http.MethodDelete, path, nil, nil)
+}
+
+const ingestPipelinesAPI = "/api/ingest_pipelines"
+
+// SimulateRequest is the body for the ingest pipeline simulate API.
+type SimulateRequest struct {
+	Pipeline   interface{}        `json:"pipeline"`
+	Documents  []SimulateDocument  `json:"documents"`
+	Verbose    bool               `json:"verbose,omitempty"`
+}
+
+// SimulateDocument is one document for simulate (ES ingest simulate format).
+type SimulateDocument struct {
+	Index  string                 `json:"_index,omitempty"`
+	ID     string                 `json:"_id,omitempty"`
+	Source map[string]interface{} `json:"_source"`
+}
+
+// SimulateResponse is the response from the ingest pipeline simulate API.
+type SimulateResponse struct {
+	Docs []SimulateDocResult `json:"docs"`
+}
+
+// SimulateDocResult is one document result from simulate.
+type SimulateDocResult struct {
+	Doc *struct {
+		Source map[string]interface{} `json:"_source"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	} `json:"doc,omitempty"`
+}
+
+// SimulatePipeline runs the ingest pipeline simulate API with the given pipeline and documents.
+func (c *Client) SimulatePipeline(pipeline interface{}, documents []SimulateDocument, verbose bool) (*SimulateResponse, error) {
+	body := SimulateRequest{Pipeline: pipeline, Documents: documents, Verbose: verbose}
+	var out SimulateResponse
+	if err := c.do(http.MethodPost, ingestPipelinesAPI+"/simulate", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

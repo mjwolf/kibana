@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"compare_framework/internal/client"
 	"compare_framework/internal/config"
 	"compare_framework/internal/compare"
 	"compare_framework/internal/compare/stages/ecs_vendor"
@@ -31,6 +32,7 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "Skip LLM stages; run only programmatic and pipeline execution")
 	consistencyMode := flag.Bool("consistency", false, "Run consistency mode (N runs, pairwise compare)")
 	verbose := flag.Bool("verbose", false, "Log each package/data stream result (status and error)")
+	fromPackages := flag.String("from-packages", "", "Load pre-generated package zips from this dir instead of calling Kibana API (overrides config pregenerated_packages_dir)")
 	flag.Parse()
 
 	var cfg *config.Config
@@ -67,7 +69,12 @@ func main() {
 	if *packageFilter != "" {
 		cfg.Packages = []string{*packageFilter}
 	}
-	_ = dataStreamFilter // TODO: pass to runner to limit to one data stream
+	if *dataStreamFilter != "" && *packageFilter != "" {
+		if cfg.DataStreams == nil {
+			cfg.DataStreams = make(map[string][]string)
+		}
+		cfg.DataStreams[*packageFilter] = []string{*dataStreamFilter}
+	}
 
 	samplesBase := wdOrCurrent()
 	if cfg.OutputDir != "" {
@@ -75,6 +82,11 @@ func main() {
 	}
 	if *reRunFrom != "" {
 		samplesBase = filepath.Dir(*reRunFrom)
+	}
+
+	packagesDir := cfg.PregeneratedPackagesDir
+	if *fromPackages != "" {
+		packagesDir = *fromPackages
 	}
 
 	var summary *runner.RunSummary
@@ -89,32 +101,61 @@ func main() {
 		fmt.Fprintf(os.Stdout, "Consistency run dir: %s\n", runDir)
 		os.Exit(exitCode)
 	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Starting comparison run (config: %s, run dir: %s)\n", *configPath, runDir)
+	}
 	r := runner.New(cfg)
-	summary, exitCode, err = r.Run(runDir, samplesBase, "")
+	if packagesDir != "" {
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Stage: loading pre-generated packages from %s\n", packagesDir)
+		}
+		summary, exitCode, err = r.RunFromPackages(runDir, packagesDir, *verbose)
+	} else {
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Stage: running packages against Kibana (create integration, upload samples, poll results)\n")
+		}
+		summary, exitCode, err = r.Run(runDir, samplesBase, "", *verbose)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
 		os.Exit(1)
 	}
 	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Kibana stage finished\n")
 		for _, res := range summary.Results {
 			if res.Error != "" {
-				fmt.Fprintf(os.Stderr, "[%s/%s] %s: %s\n", res.Package, res.DataStream, res.Status, res.Error)
+				fmt.Fprintf(os.Stderr, "[verbose]   [%s/%s] %s: %s\n", res.Package, res.DataStream, res.Status, res.Error)
 			} else {
-				fmt.Fprintf(os.Stderr, "[%s/%s] %s\n", res.Package, res.DataStream, res.Status)
+				fmt.Fprintf(os.Stderr, "[verbose]   [%s/%s] %s\n", res.Package, res.DataStream, res.Status)
 			}
 		}
 	}
 
-	// Pipeline execution (elastic-package) for each package that has result.json
-	pipeResults, _ := pipeline.Exec(pipeline.ExecOptions{
-		IntegrationsDir: cfg.IntegrationsDir,
-		RunDir:          runDir,
-		SamplesDir:      samplesBase,
-		Timeout:         cfg.ElasticPackageTimeout,
-	})
+	// Pipeline execution (Kibana simulate API) only when at least one generated package exists.
+	var pipeResults []pipeline.ExecResult
+	if summary.PassCount > 0 {
+		kibanaClient := client.New(cfg.KibanaURL, client.AuthHeader(cfg.Auth.Type, cfg.Auth.APIKey, cfg.Auth.Username, cfg.Auth.Password), cfg.HTTPTimeout, cfg.HTTPRetries)
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Stage: pipeline execution (Kibana simulate API)\n")
+		}
+		pipeResults, _ = pipeline.Exec(pipeline.ExecOptions{
+			IntegrationsDir: cfg.IntegrationsDir,
+			RunDir:          runDir,
+			SamplesDir:      samplesBase,
+			Client:          kibanaClient,
+		})
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Pipeline execution finished\n")
+		}
+	} else if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Skipping pipeline execution (no generated package)\n")
+	}
 	_ = pipeResults
 
 	// Run comparison stages and compile report
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Stage: comparison (programmatic, pipeline equivalence, processor choice, ECS/vendor)\n")
+	}
 	var stageResults []compare.StageResult
 	for _, res := range summary.Results {
 		if res.Status != "pass" {
@@ -122,6 +163,9 @@ func main() {
 		}
 		gPath := res.GoldenPath
 		rPath := res.ResultPath
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Running stages for %s/%s (golden=%s result=%s)\n", res.Package, res.DataStream, gPath, rPath)
+		}
 		stageResults = append(stageResults, programmatic.Run(gPath, rPath))
 		if !*dryRun {
 			stageResults = append(stageResults, pipeline_equivalence.Run(gPath, rPath, nil))
@@ -129,6 +173,9 @@ func main() {
 			stageResults = append(stageResults, ecs_vendor.Run(nil, nil, nil))
 		}
 		break
+	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Comparison stages finished (%d stage result(s))\n", len(stageResults))
 	}
 	// When no runs passed, do not add programmatic stage with empty paths (avoids misleading "missing golden or generated output path").
 	overallScore := 0
@@ -139,6 +186,9 @@ func main() {
 	rep := compiler.Compile(stageResults, summary.PassCount, summary.FailCount, summary.SkipCount, overallScore)
 	if err := report.Write(runDir, rep); err != nil {
 		fmt.Fprintf(os.Stderr, "report: %v\n", err)
+	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Report written to %s (report.md, report.json)\n", runDir)
 	}
 	fmt.Fprintf(os.Stdout, "Run dir: %s\n", runDir)
 	fmt.Fprintf(os.Stdout, "%s\n", rep.Summary.Overview)

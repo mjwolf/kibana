@@ -5,9 +5,8 @@ Standalone test framework for the LLM-driven Automatic Import V2 package generat
 ## Requirements
 
 - Go 1.25+
-- `elastic-package` on PATH (for pipeline execution)
 - `GOOGLE_API_KEY` env var (Gemini API key)
-- Kibana with Automatic Import V2 API (plugin enabled). For local/dev use you must allow external access to internal APIs so the compare framework can call the API. In Kibana’s config (e.g. `config/kibana.dev.yml`) set:
+- Kibana with Automatic Import V2 and ingest_pipelines plugins. Pipeline testing uses the Kibana simulate API (`/api/ingest_pipelines/simulate`). For local/dev use you must allow external access to internal APIs so the compare framework can call the API. In Kibana’s config (e.g. `config/kibana.dev.yml`) set:
   ```yaml
   server.restrictInternalApis: false
   ```

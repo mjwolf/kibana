@@ -17,10 +17,11 @@ const maxSamplesPerStream = 100
 
 // SeedOptions configures the seed operation.
 type SeedOptions struct {
-	IntegrationsDir string
-	OutputDir       string   // base dir under which samples/<pkg>/<ds>/samples.log or samples.ndjson is written
-	Seed            int64    // RNG seed for reproducibility; 0 uses default
-	PackageFilter   []string // if non-empty, only these packages
+	IntegrationsDir   string
+	OutputDir         string              // base dir under which samples/<pkg>/<ds>/samples.log or samples.ndjson is written
+	Seed              int64               // RNG seed for reproducibility; 0 uses default
+	PackageFilter     []string            // if non-empty, only these packages
+	DataStreamFilter  map[string][]string // if non-nil, only seed these data streams per package; unspecified packages seed all
 }
 
 // Seed builds the sample corpus from the integrations repo and writes samples to OutputDir (samples/<pkg>/<ds>/samples.log for text logs, samples.ndjson for JSON).
@@ -56,6 +57,9 @@ func Seed(opts SeedOptions) (written int, err error) {
 		}
 		for _, ds := range dsEntries {
 			if !ds.IsDir() || strings.HasPrefix(ds.Name(), ".") {
+				continue
+			}
+			if !shouldSeedDS(opts.DataStreamFilter, e.Name(), ds.Name()) {
 				continue
 			}
 			pipeDir := filepath.Join(dataStreamsDir, ds.Name(), "_dev", "test", "pipeline")
@@ -210,6 +214,22 @@ func writeLines(path string, lines []string) error {
 		}
 	}
 	return nil
+}
+
+func shouldSeedDS(filter map[string][]string, pkg, ds string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+	allowed, ok := filter[pkg]
+	if !ok {
+		return true
+	}
+	for _, a := range allowed {
+		if a == ds {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveSamplesPath returns the path to the samples file for a package/data stream (samples.log or samples.ndjson).

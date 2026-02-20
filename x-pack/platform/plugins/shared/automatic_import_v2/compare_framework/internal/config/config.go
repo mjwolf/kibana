@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"compare_framework/internal/client"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -32,12 +34,14 @@ type ScoreWeights struct {
 
 // Config is the framework configuration.
 type Config struct {
-	IntegrationsDir              string       `yaml:"integrations_dir"`
-	KibanaURL                    string       `yaml:"kibana_url"`
-	ConnectorID                  string       `yaml:"connector_id"`
-	Auth                         Auth         `yaml:"auth"`
-	Packages                     []string     `yaml:"packages"` // package names or path to list file
-	OutputDir                    string       `yaml:"output_dir"`
+	IntegrationsDir              string                `yaml:"integrations_dir"`
+	KibanaURL                    string                `yaml:"kibana_url"`
+	ConnectorID                  string                `yaml:"connector_id"`
+	Auth                         Auth                  `yaml:"auth"`
+	Packages                     []string              `yaml:"packages"`      // package names or path to list file
+	DataStreams                   map[string][]string   `yaml:"data_streams"`  // optional: per-package data stream filter (e.g. {"cisco_ios": ["log"]}); unspecified packages test all data streams
+	OutputDir                    string                `yaml:"output_dir"`
+	PregeneratedPackagesDir      string                `yaml:"pregenerated_packages_dir"` // when set, load packages from zip files here instead of calling Kibana API
 	ECSFieldsURL                 string       `yaml:"ecs_fields_url"`
 	GeminiModel                  string       `yaml:"gemini_model"`
 	GeminiTemperature            float64      `yaml:"gemini_temperature"`
@@ -50,14 +54,13 @@ type Config struct {
 	HTTPRetries            int    `yaml:"http_retries"`
 	HTTPTimeoutStr         string `yaml:"http_timeout"`
 	GeminiTimeoutStr       string `yaml:"gemini_timeout"`
-	ElasticPackageTimeoutStr string `yaml:"elastic_package_timeout"`
 	// Parsed durations (set in Load)
-	HTTPTimeout            time.Duration `yaml:"-"`
-	GeminiTimeout          time.Duration `yaml:"-"`
-	ElasticPackageTimeout  time.Duration `yaml:"-"`
+	HTTPTimeout   time.Duration `yaml:"-"`
+	GeminiTimeout time.Duration `yaml:"-"`
 	IntegrationsRef        string `yaml:"integrations_ref"` // optional git ref for golden pinning
 	GoldenSnapshotDir            string       `yaml:"golden_snapshot_dir"`   // optional path to frozen golden copy
 	Seed                         int64        `yaml:"seed"`                  // for seed-samples RNG
+	LangSmith                    *client.LangSmithOptions `yaml:"langsmith"`
 }
 
 // DefaultConfig returns config with defaults applied.
@@ -74,7 +77,6 @@ func DefaultConfig() Config {
 		HTTPRetries:           3,
 		HTTPTimeoutStr:        "60s",
 		GeminiTimeoutStr:      "120s",
-		ElasticPackageTimeoutStr: "300s",
 		ScoreWeights: ScoreWeights{
 			Programmatic:        0.3,
 			PipelineEquivalence: 0.25,
@@ -116,6 +118,9 @@ func Load(path string) (*Config, error) {
 	if cfg.GoldenSnapshotDir != "" {
 		cfg.GoldenSnapshotDir = expandPath(cfg.GoldenSnapshotDir)
 	}
+	if cfg.PregeneratedPackagesDir != "" {
+		cfg.PregeneratedPackagesDir = expandPath(cfg.PregeneratedPackagesDir)
+	}
 	// Parse durations
 	if cfg.HTTPTimeoutStr != "" {
 		if d, err := time.ParseDuration(cfg.HTTPTimeoutStr); err == nil {
@@ -134,15 +139,6 @@ func Load(path string) (*Config, error) {
 		}
 	} else {
 		cfg.GeminiTimeout = 120 * time.Second
-	}
-	if cfg.ElasticPackageTimeoutStr != "" {
-		if d, err := time.ParseDuration(cfg.ElasticPackageTimeoutStr); err == nil {
-			cfg.ElasticPackageTimeout = d
-		} else {
-			cfg.ElasticPackageTimeout = 300 * time.Second
-		}
-	} else {
-		cfg.ElasticPackageTimeout = 300 * time.Second
 	}
 	return &cfg, nil
 }
@@ -176,6 +172,24 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("consistency_compare_mode must be per_package or cross_package_only")
 	}
 	return nil
+}
+
+// ShouldTestDataStream returns true if the given data stream should be tested for the package.
+// When the package is absent from the DataStreams map, all data streams are tested.
+func (c *Config) ShouldTestDataStream(pkg, dataStream string) bool {
+	if len(c.DataStreams) == 0 {
+		return true
+	}
+	ds, ok := c.DataStreams[pkg]
+	if !ok {
+		return true
+	}
+	for _, d := range ds {
+		if d == dataStream {
+			return true
+		}
+	}
+	return false
 }
 
 // PackageList returns the list of package names to run. If packages is a single path to a file, read it.
