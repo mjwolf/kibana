@@ -5,19 +5,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
+	"compare_framework/internal/agentrunner"
 	"compare_framework/internal/client"
-	"compare_framework/internal/config"
 	"compare_framework/internal/compare"
 	"compare_framework/internal/compare/stages/ecs_vendor"
 	"compare_framework/internal/compare/stages/pipeline_equivalence"
 	"compare_framework/internal/compare/stages/processor_choice"
 	"compare_framework/internal/compare/stages/programmatic"
+	"compare_framework/internal/config"
 	"compare_framework/internal/consistency"
 	"compare_framework/internal/pipeline"
 	"compare_framework/internal/report"
@@ -156,6 +158,18 @@ func main() {
 	if *verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Stage: comparison (programmatic, pipeline equivalence, processor choice, ECS/vendor)\n")
 	}
+
+	// Create the ADK agent runner once for all LLM stages.
+	ctx := context.Background()
+	var agentRunner *agentrunner.Runner
+	if !*dryRun {
+		ar, arErr := agentrunner.New(ctx, cfg.GeminiModel)
+		if arErr != nil {
+			fmt.Fprintf(os.Stderr, "[warn] agent runner init failed (LLM stages will be skipped): %v\n", arErr)
+		}
+		agentRunner = ar
+	}
+
 	var stageResults []compare.StageResult
 	for _, res := range summary.Results {
 		if res.Status != "pass" {
@@ -168,7 +182,14 @@ func main() {
 		}
 		stageResults = append(stageResults, programmatic.Run(gPath, rPath))
 		if !*dryRun {
-			stageResults = append(stageResults, pipeline_equivalence.Run(gPath, rPath, nil))
+			stageResults = append(stageResults, pipeline_equivalence.Run(ctx, pipeline_equivalence.Options{
+				Runner:          agentRunner,
+				IntegrationsDir: cfg.IntegrationsDir,
+				Package:         res.Package,
+				DataStream:      res.DataStream,
+				ResultPath:      rPath,
+				Temperature:     cfg.GeminiTemperature,
+			}))
 			stageResults = append(stageResults, processor_choice.Run(nil, nil))
 			stageResults = append(stageResults, ecs_vendor.Run(nil, nil, nil))
 		}
